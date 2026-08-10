@@ -1,0 +1,37 @@
+# Secrets — NEVER commit
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.uv/
+uv.lock
+*.egg-info/
+dist/
+build/
+
+# Local data
+data/
+backups/
+*.log
+
+# Local server tools (hard paths) — NOT for the repo
+fix_created_at.py
+
+# Security scan results — local
+.agentic-security/
+
+# Node
+node_modules/
+# Local server symlink into opencode node_modules — DO NOT commit (VPS path)
+agents/opencode/node_modules
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

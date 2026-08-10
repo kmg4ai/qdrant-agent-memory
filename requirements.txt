@@ -1,0 +1,4 @@
+# Deps managed by pyproject.toml (uv sync / pip install -r requirements.txt)
+qdrant-client[fastembed]>=1.14.2
+python-dotenv
+fastmcp

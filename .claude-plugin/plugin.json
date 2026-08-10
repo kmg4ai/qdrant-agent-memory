@@ -1,0 +1,23 @@
+{
+  "name": "qdrant-agent-memory",
+  "description": "Semantic vector memory for AI agents (opencode, Claude Code, Hermes) via Qdrant — no MCP required. One tool, 18 operations: search, store, stats, edit, dedupe, delete.",
+  "version": "1.0.0",
+  "author": {
+    "name": "kmg4ai"
+  },
+  "homepage": "https://github.com/kmg4ai/qdrant-agent-memory",
+  "repository": "https://github.com/kmg4ai/qdrant-agent-memory",
+  "license": "MIT",
+  "keywords": [
+    "qdrant",
+    "memory",
+    "rag",
+    "vector-search",
+    "semantic-memory",
+    "ai-agent",
+    "agent-memory"
+  ],
+  "skills": [
+    "qdrant-agent-memory"
+  ]
+}

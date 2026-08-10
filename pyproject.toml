@@ -1,0 +1,25 @@
+[project]
+name = "qdrant-agent-memory"
+version = "1.0.0"
+description = "Agent AI memory layer: Qdrant vector database for semantic memory across coding agents (opencode, Claude Code, Hermes)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "kmg4ai" }]
+keywords = ["qdrant", "rag", "memory", "vector-search", "ai-agent", "semantic-memory", "opencode", "claude-code", "hermes"]
+dependencies = [
+    "qdrant-client[fastembed]>=1.14.2",
+    "python-dotenv",
+    "fastmcp",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+mcp = [
+    "fastmcp",
+]
+
+[tool.uv]
+package = false
