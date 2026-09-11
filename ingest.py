@@ -122,6 +122,10 @@ def store_facts(facts: list[dict], source: str, mode="replace") -> int:
                 "section": fact.get("section", ""),
                 "file_path": fact.get("file_path", ""),
                 "type": fact.get("type", ""),
+                # Skrypt, nie agent — dlatego na sztywno `ingest`, a nie
+                # detect_agent(). Bez tego kazdy ingest dodawal wpisy bez
+                # autora i backfill trzeba by powtarzac w nieskonczonosc.
+                "agent": "ingest",
             }
             if COLLECTION.endswith("-v2"):
                 vec += time_features(cts)
