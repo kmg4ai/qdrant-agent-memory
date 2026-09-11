@@ -3,6 +3,9 @@
 
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from agent_id import detect_agent  # noqa: E402  (po sys.path, celowo)
 import re
 import json
 import time
@@ -191,6 +194,17 @@ def stats():
     print(f"{'agent':22s} {'count':>5s}")
     for a in sorted(by_agent, key=lambda k: (-by_agent[k], k)):
         print(f"{a:22s} {by_agent[a]:5d}")
+
+    # `via` odpowiada na inne pytanie niz `agent`: nie KTO, a JAK. Rozdzielone,
+    # bo wpis wciagniety przez ingest.py ma autora (kto odpalil skrypt)
+    # i mechanizm (skrypt) — a zlepienie ich w jedno pole gubi autora.
+    by_via = defaultdict(int)
+    for p in points:
+        by_via[p.payload.get("via") or "?"] += 1
+    print()
+    print(f"{'via':22s} {'count':>5s}")
+    for v in sorted(by_via, key=lambda k: (-by_via[k], k)):
+        print(f"{v:22s} {by_via[v]:5d}")
 
 
 def list_source(source, limit=50):
@@ -590,56 +604,6 @@ def setup(name=None):
     print(f"  Collection '{n}' created ({dim}-dim, COSINE)")
 
 
-# ─── Kto zapisuje ──────────────────────────────────────────────────────────
-#
-# Auto-detekcja z markerow srodowiskowych, ktore zostawia kazdy agent.
-# Kolejnosc ma znaczenie: pierwszy trafiony wygrywa. Agenta uruchamiajacego
-# innego agenta wpisujemy WYZEJ tylko wtedy, gdy to on jest autorem wpisu —
-# inaczej przypisalby sobie cudza prace.
-#
-# QDRANT_AGENT nadpisuje wszystko: wrapper, ktory wie lepiej niz srodowisko,
-# powinien moc powiedziec to wprost.
-_AGENT_MARKERS = (
-    ("CLAUDE_CODE_SESSION_ID", "claude"),
-    ("CLAUDE_CODE_ENTRYPOINT", "claude"),
-    ("CLAUDE_CODE_EXECPATH", "claude"),
-    ("OPENCODE_CONFIG", "opencode"),
-    ("OPENCODE_BIN", "opencode"),
-    ("OPENCODE", "opencode"),
-    ("HERMES_HOME", "hermes"),
-    ("HERMES", "hermes"),
-    ("CURSOR_TRACE_ID", "cursor"),
-    ("CODEX_HOME", "codex"),
-    ("AIDER_MODEL", "aider"),
-    ("CLINE_DIR", "cline"),
-    ("WINDSURF_HOME", "windsurf"),
-    ("GEMINI_CLI_HOME", "gemini"),
-    ("GOOSE_HOME", "goose"),
-    ("CRUSH_HOME", "crush"),
-    ("AMP_HOME", "amp"),
-)
-
-
-def detect_agent() -> str:
-    """Nazwa agenta piszacego wpis: QDRANT_AGENT, potem markery, potem 'manual'.
-
-    Nazwy sa krotkie, ale NIE skracane do inicjalow (`claude`, nie `CC` — to
-    tez kompilator C i carbon copy). Zgadzaja sie z katalogami w `agents/`,
-    wiec mapa agent→integracja jest jedna.
-
-    Miejsca to nie oszczedza: roznica `CC` vs `ClaudeCode` to ~8 B na wpis,
-    czyli ~27 KB na calej 3468-punktowej kolekcji — pol procenta tego, co
-    zajmuja same wektory. Wiec wybieramy czytelnosc, nie bajty.
-    """
-    override = (os.environ.get("QDRANT_AGENT") or "").strip()
-    if override:
-        return override
-    for var, name in _AGENT_MARKERS:
-        if os.environ.get(var):
-            return name
-    return "manual"
-
-
 def store(text, source="manual"):
     """Store memory in Qdrant — embed text (+time features for v2) and send with payload."""
     # Secret Guard — redact secrets before anything reaches Qdrant
@@ -648,7 +612,8 @@ def store(text, source="manual"):
     text = scrub(text, source)
     vec = _embed(text)
     now = int(time.time())
-    payload = {"text": text, "source": source, "agent": detect_agent()}
+    payload = {"text": text, "source": source,
+               "agent": detect_agent(), "via": "store"}
     if COLLECTION.endswith("-v2"):
         payload["ts_epoch"] = now
     client.upsert(

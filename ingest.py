@@ -13,6 +13,9 @@ from datetime_utils import content_ts, time_features
 # Secret Guard — redaction of secrets in all facts before storing
 from secret_guard import scrub
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from agent_id import detect_agent  # noqa: E402  (po sys.path, celowo)
+
 _BATCH_SIZE = 10
 
 
@@ -122,10 +125,12 @@ def store_facts(facts: list[dict], source: str, mode="replace") -> int:
                 "section": fact.get("section", ""),
                 "file_path": fact.get("file_path", ""),
                 "type": fact.get("type", ""),
-                # Skrypt, nie agent — dlatego na sztywno `ingest`, a nie
-                # detect_agent(). Bez tego kazdy ingest dodawal wpisy bez
-                # autora i backfill trzeba by powtarzac w nieskonczonosc.
-                "agent": "ingest",
+                # KTO wywolal i JAK. Ingest NIE chodzi z timera ani crona —
+                # autorem jest zawsze ktos konkretny i jest poznawalny ze
+                # srodowiska. Wczesniej bylo tu na sztywno "ingest", co mowilo
+                # tylko "zrobil to skrypt" i gubilo autora.
+                "agent": detect_agent(),
+                "via": "ingest",
             }
             if COLLECTION.endswith("-v2"):
                 vec += time_features(cts)
