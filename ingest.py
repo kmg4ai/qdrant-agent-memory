@@ -26,7 +26,10 @@ FORCE_REPLACE = "--replace" in sys.argv
 
 # ===== SOURCE PATHS (configurable via env; defaults are typical locations) =====
 VPS_DOC_PATH = os.getenv("QDRANT_VPS_DOC", os.path.expanduser("~/VPS.md"))
-CHANGELOG_PATH = os.getenv("QDRANT_CHANGELOG", "CHANGELOG.md")
+# Absolutna, bo jako jedyna była względna: uruchomienie z innego katalogu
+# kończyło się FileNotFoundError. Reszta ścieżek w tym pliku jest absolutna
+# (VPS.md, /var/www, /etc/nginx, /etc/systemd) — ta jedna została przeoczona.
+CHANGELOG_PATH = os.getenv("QDRANT_CHANGELOG", "/root/CHANGELOG.md")
 WWW_ROOT = os.getenv("QDRANT_WWW_ROOT", "/var/www")
 NGINX_DIR = os.getenv("QDRANT_NGINX_DIR", "/etc/nginx/sites-enabled")
 SYSTEMD_DIR = os.getenv("QDRANT_SYSTEMD_DIR", "/etc/systemd/system")
