@@ -6,7 +6,9 @@ description: Work with the Qdrant vector database (semantic memory) — search, 
 # qdrant — semantic memory via a single tool (no MCP)
 
 Qdrant is a vector database storing semantic memory (documentation, changelog, findings, sessions).
-**Do not use MCP** — the single tool `qdrant-agent-memory-tool.py` has ALL 18 operations (including `store`).
+The single tool `qdrant-agent-memory-tool.py` has ALL 18 operations (including `store`).
+In OpenCode only 4 CORE operations are exposed as MCP tools (`search`, `store`, `searchTemporal`, `stats`) —
+**all ADMIN operations (show, edit, dedupe, delete, backup, reindex...) must be invoked via bash** using this skill.
 Invoke it via python from the qdrant-agent-memory install (venv OR global uv through QDRANT_RUNNER).
 
 ## Always
