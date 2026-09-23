@@ -37,6 +37,34 @@ EMBED_MODEL = os.getenv(
     "QDRANT_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
 
+# ─── Reranker (drugi etap wyszukiwania) ────────────────────────────────
+# Cross-encoder czyta zapytanie i dokument RAZEM, więc szereguje precyzyjniej
+# niż sam cosinus. Zmierzone na 104 trudnych zapytaniach: produkcyjna ścieżka
+# 24% -> 50% hit@5, MRR 0.163 -> 0.383, McNemar p < 0.001 (29 wygranych,
+# 2 przegrane). Sufit recall@50 = 64%, więc bierze 78% tego, co osiągalne.
+#
+# Model jest ANGIELSKI (jina-reranker-v1-turbo-en) i to jest kompromis, nie
+# optimum: wielojęzyczny (jina-reranker-v2-base-multilingual) ma RSS ~2,4 GB
+# i na tym serwerze nie wstaje — earlyoom wysyła mu SIGTERM. Angielski działa
+# na polskim korpusie lepiej niż bi-enkoder, co jest zmierzone, nie założone.
+RERANK_ENABLED = os.getenv("QDRANT_RERANK", "1") != "0"
+RERANK_MODEL = os.getenv("QDRANT_RERANK_MODEL", "jinaai/jina-reranker-v1-turbo-en")
+# 50 kandydatów: recall@50 = 64% (przy 30 kandydatach ~60%, czyli mniej).
+RERANK_CANDIDATES = int(os.getenv("QDRANT_RERANK_CANDIDATES", "50"))
+# Reranker przyjmuje maks. ~512 tokenów, więc dłuższego tekstu nie przeczyta —
+# a jego potokenizowanie i zaalokowanie kosztuje. Wpisy changelogu mają do 4798
+# znaków, stąd obcięcie.
+RERANK_MAX_CHARS = 2000
+# batch 8, nie domyślne 64: przy 64 i długich tekstach proces zjadał ~1,4 GB
+# więcej i wypadał poza próg earlyoom.
+RERANK_BATCH = 8
+# Poniżej tylu MB wolnego RAM nie wczytujemy rerankera — earlyoom zabija
+# największy proces na maszynie, a to może być cudza praca.
+RERANK_MIN_FREE_MB = 1200
+
+_reranker = None
+_reranker_failed = False
+
 BACKUP_DIR = os.path.join(os.path.dirname(__file__), "backups")
 
 _DATE_RE = re.compile(r"20\d{2}-\d{2}-\d{2}")
@@ -369,39 +397,95 @@ def reindex_source(source=None, batch_size=64):
 
 
 # ─── Duplicates ────────────────────────────────────────────────────────
-def _find_dup_groups():
-    points = _scroll_all()
+# Znacznik daty w nagłówku wpisu: „2026-09-22 22:04: treść".
+_DUP_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?:\s*", re.S)
+# Minimalna długość treści, by uznać ją za duplikat w trybie znormalizowanym.
+# Próg jest istotny: krótkie fragmenty („check: 644 www-data, http 200")
+# powtarzają się w RÓŻNYCH wpisach legalnie — to boilerplate, nie duplikaty.
+DUP_MIN_CHARS = 60
+
+
+def _dup_key(text, normalize=False):
+    """Klucz grupowania duplikatów.
+
+    Tryb surowy (dotychczasowy) bierze CAŁY tekst — i dlatego znajdował ZERO
+    grup. Kopie w tej kolekcji różnią się znacznikiem daty w nagłówku
+    („2026-06-23 14:45:" vs „2026-09-22 22:04:"), więc surowy tekst nigdy się
+    nie zgadza. `find-dupes` raportowało „No duplicates" na korpusie, który ma
+    2482 takie grupy.
+
+    Tryb znormalizowany zdejmuje znacznik daty i normalizuje białe znaki.
+    Zwraca None dla tekstów krótszych niż DUP_MIN_CHARS.
+    """
+    if normalize:
+        t = re.sub(r"\s+", " ", _DUP_DATE_PREFIX.sub("", text.strip())).strip().lower()
+        if len(t) < DUP_MIN_CHARS:
+            return None
+    else:
+        t = text
+    return hashlib.md5(t.encode()).hexdigest()
+
+
+def _find_dup_groups(normalize=False):
     by_hash = defaultdict(list)
-    for p in points:
-        h = hashlib.md5(p.payload.get("text", "").encode()).hexdigest()
-        by_hash[h].append(p)
+    for p in _scroll_all():
+        k = _dup_key(p.payload.get("text", ""), normalize)
+        if k is not None:
+            by_hash[k].append(p)
     return [g for g in by_hash.values() if len(g) > 1]
 
 
 def find_dupes():
-    groups = _find_dup_groups()
-    if not groups:
-        print("  No duplicates")
+    """Raportuje OBIE liczby — surową i po normalizacji daty.
+
+    Pokazywanie tylko surowej było kłamstwem: 0 grup przy 2482 realnych.
+    """
+    raw = _find_dup_groups(normalize=False)
+    norm = _find_dup_groups(normalize=True)
+    n_raw = sum(len(g) - 1 for g in raw)
+    n_norm = sum(len(g) - 1 for g in norm)
+    print("  Tryb surowy (md5 całego tekstu) — na tym działa `dedupe` bez flagi:")
+    print(f"    grup: {len(raw)}, nadmiarowych punktów: {n_raw}")
+    print(f"  Tryb znormalizowany (bez znacznika daty, >= {DUP_MIN_CHARS} znaków):")
+    print(f"    grup: {len(norm)}, nadmiarowych punktów: {n_norm}")
+    if not norm:
+        print("  Brak duplikatów w obu trybach")
         return
-    print(
-        f"Found {len(groups)} duplicate groups ({sum(len(g) for g in groups)} points total):"
-    )
-    for g in groups:
+    print(f"\n  Grupy (tryb znormalizowany, pokazano do 15 z {len(norm)}):")
+    for g in norm[:15]:
         print(f"  Group ({len(g)} points):")
         for p in g:
             d = _point_date(p) or "no-date"
             print(
                 f"    [{d}] ID={p.id} src={p.payload.get('source', '?')} {p.payload.get('text', '')[:60]}"
             )
+    if n_norm:
+        print(
+            f"\n  UWAGA: usunięcie ich przez `dedupe --normalize` skasuje {n_norm} "
+            f"punktów.\n  Zmierzone: zysk +4 pp hit@5 przy p=0.219 (SZUM) — "
+            "czyli nieudowodniony."
+        )
 
 
-def dedupe():
-    groups = _find_dup_groups()
+def dedupe(normalize=False):
+    """Usuwa duplikaty — domyślnie tryb SUROWY (zachowanie jak dotąd).
+
+    Tryb znormalizowany (flaga --normalize) usuwa realne kopie różniące się
+    znacznikiem daty — ale to kasuje ~2218 punktów (27% korpusu) przy zysku
+    +4 pp hit@5 zmierzonym jako NIEstotny (p=0.219). Dlatego NIE jest
+    domyślny: domyślne zachowanie nie może być nieodwracalne bez dowodu.
+    """
+    groups = _find_dup_groups(normalize=normalize)
     if not groups:
-        print("  No duplicates")
+        print(f"  No duplicates (tryb {'znormalizowany' if normalize else 'surowy'})")
         return
     total_dup = sum(len(g) for g in groups)
     print(f"Found {len(groups)} groups / {total_dup} duplicate points")
+    if normalize:
+        print(
+            f"  ⚠️  tryb znormalizowany: usuniętych zostanie {total_dup} punktów "
+            "(kopie różniące się tylko datą w nagłówku)"
+        )
 
     to_delete = []
     for g in groups:
@@ -437,8 +521,57 @@ def dedupe():
     print(f"  Deleted {len(to_delete)} duplicates")
 
 
+# ─── Reranker helpers ──────────────────────────────────────────────────
+def _mem_available_mb():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        return 10**6  # nie wiemy — nie blokuj z powodu braku odczytu
+    return 10**6
+
+
+def _get_reranker():
+    """Reranker JEDEN RAZ NA PROCES.
+
+    Ładowanie modelu trwa ~5–9 s — przy ładowaniu per zapytanie wyszukiwanie
+    przez CLI robiłoby się kilkunastosekundowe zamiast kilkusekundowego.
+    Dla serwera MCP (proces długożyjący) to jednorazowy koszt startu.
+    """
+    global _reranker, _reranker_failed
+    if _reranker is not None or _reranker_failed:
+        return _reranker
+    avail = _mem_available_mb()
+    if avail < RERANK_MIN_FREE_MB:
+        _reranker_failed = True
+        print(
+            f"  ⚠️  reranker pominięty: {avail} MB wolnego RAM "
+            f"< {RERANK_MIN_FREE_MB} MB (earlyoom zabija największy proces)"
+        )
+        return None
+    try:
+        from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+        _reranker = TextCrossEncoder(model_name=RERANK_MODEL)
+    except Exception as e:  # brak modelu / brak pamięci / zły cache
+        _reranker_failed = True
+        print(f"  ⚠️  reranker niedostępny ({type(e).__name__}: {e}) — ranking po cosinusie")
+        return None
+    return _reranker
+
+
+def _minmax(xs):
+    lo, hi = min(xs), max(xs)
+    if hi - lo < 1e-9:
+        return [0.5] * len(xs)
+    return [(x - lo) / (hi - lo) for x in xs]
+
+
 # ─── Deleting (existing) ───────────────────────────────────────────────
-def search(text, limit=10, fresh=True, since=None, window_days=None, lmbda=0.01):
+def search(text, limit=10, fresh=True, since=None, window_days=None, lmbda=0.01,
+           rerank=None):
     vec = _embed(text)
     # Optional time filter — native DATETIME index
     from qdrant_client.models import Range as QdRange
@@ -459,23 +592,49 @@ def search(text, limit=10, fresh=True, since=None, window_days=None, lmbda=0.01)
             must=[FieldCondition(key="ts_epoch", range=QdRange(gte=gte))]
         )
 
+    use_rerank = RERANK_ENABLED if rerank is None else rerank
+    # Przy reranku pobieramy 50 kandydatów (recall@50 = 64%), bez niego
+    # zostaje dawne potrójne przewężenie.
+    n_fetch = max(limit * 3, RERANK_CANDIDATES) if use_rerank else limit * 3
+
     results = client.query_points(
         collection_name=COLLECTION,
         query=vec,
-        limit=limit * 3,  # overshoot — trimmed after decay
+        limit=n_fetch,
         with_payload=True,
         query_filter=time_filter,
     ).points
 
-    # Time-decay
-    scored = []
+    # Zanik czasu trzymamy jako OSOBNY czynnik, a nie wmnożony w score.
+    # Powód: reranker PODMIENIA bazowy score, więc gdyby decay był już
+    # w środku, nie dałoby się go zastosować po reranku — a wtedy zanik czasu
+    # po cichu przestałby działać. Tak mnożymy go na końcu, po normalizacji.
+    cand = []
     for r in results:
         ts = _point_ts(r)
-        score = r.score
+        d = 1.0
         if fresh and ts is not None:
-            age_days = (now_ts - ts) / 86400
-            score = r.score * _decay(age_days, lmbda)
-        scored.append((score, r))
+            d = _decay((now_ts - ts) / 86400, lmbda)
+        cand.append((r, d))
+
+    scored = None
+    if use_rerank and len(cand) > 1:
+        model = _get_reranker()
+        if model is not None:
+            try:
+                texts_c = [r.payload.get("text", "")[:RERANK_MAX_CHARS] for r, _ in cand]
+                raw = list(model.rerank(text, texts_c, batch_size=RERANK_BATCH))
+                # Normalizacja min-max PRZED mnożeniem przez zanik czasu.
+                # Wyniki cross-encodera to logity o dużej skali (często ujemne),
+                # więc bez normalizacji pomnożenie przez ~0.77 nic nie zmienia
+                # i zanik czasu przestaje cokolwiek znaczyć.
+                norm = _minmax(raw)
+                scored = [(norm[i] * cand[i][1], cand[i][0]) for i in range(len(cand))]
+            except Exception as e:
+                print(f"  ⚠️  rerank nieudany ({type(e).__name__}: {e}) — ranking po cosinusie")
+
+    if scored is None:
+        scored = [(r.score * d, r) for r, d in cand]
 
     scored.sort(key=lambda x: x[0], reverse=True)
     for score, r in scored[:limit]:
@@ -690,7 +849,10 @@ def store(text, source="manual"):
 def help():
     print("Usage:")
     print(
-        "  qdrant-agent-memory-tool.py search <text> [limit]               — semantic search"
+        "  qdrant-agent-memory-tool.py search <text> [limit] [--all] [--since D] [--window Nd] [--no-rerank]"
+    )
+    print(
+        "        — semantic search; domyślnie z rerankerem (+26 pp hit@5, ~5 s). --no-rerank = sam cosinus"
     )
     print(
         "        [--all] [--since YYYY-MM-DD] [--window 30d]   — time: decay / since / window"
@@ -715,10 +877,10 @@ def help():
         "  qdrant-agent-memory-tool.py reindex-all                         — recompute ALL vectors (backup; po zmianie modelu)"
     )
     print(
-        "  qdrant-agent-memory-tool.py find-dupes                          — show duplicates with dates"
+        "  qdrant-agent-memory-tool.py find-dupes                          — duplicates: tryb surowy ORAZ po normalizacji daty"
     )
     print(
-        "  qdrant-agent-memory-tool.py dedupe                              — remove duplicates (newest kept)"
+        "  qdrant-agent-memory-tool.py dedupe [--normalize]                — usuń duplikaty (najnowsza zostaje); --normalize = też kopie różniące się datą (kasuje ~27% korpusu)"
     )
     print("  qdrant-agent-memory-tool.py delete-id <id> [id...]              — delete by ID (backup)")
     print("  qdrant-agent-memory-tool.py delete-source <source>              — delete whole source")
@@ -760,7 +922,12 @@ if __name__ == "__main__":
             since = args[args.index("--since") + 1]
         if "--window" in args:
             window_days = int(args[args.index("--window") + 1].rstrip("d"))
-        search(text, limit, fresh=fresh, since=since, window_days=window_days)
+        # --no-rerank: ranking samym cosinusem. Reranker daje +26 pp trafień,
+        # ale kosztuje ~5 s i jest angielski — bywa potrzebny wariant szybki.
+        rerank = False if "--no-rerank" in args else None
+        search(
+            text, limit, fresh=fresh, since=since, window_days=window_days, rerank=rerank
+        )
     elif cmd == "store":
         text = args[0]
         source = args[1] if len(args) > 1 else "manual"
@@ -800,7 +967,9 @@ if __name__ == "__main__":
     elif cmd == "find-dupes":
         find_dupes()
     elif cmd == "dedupe":
-        dedupe()
+        # --normalize: usuń także kopie różniące się tylko datą w nagłówku.
+        # NIE domyślnie — kasuje ~27% korpusu przy zysku zmierzonym jako szum.
+        dedupe(normalize="--normalize" in args)
     elif cmd == "delete-id":
         delete_by_ids(args)
     elif cmd == "delete-source":
