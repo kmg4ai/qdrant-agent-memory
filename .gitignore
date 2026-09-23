@@ -23,6 +23,9 @@ backups/
 # Local server tools (hard paths) — NOT for the repo
 fix_created_at.py
 
+# Stan roboczy projektu (ścieżki serwera, decyzje) — NOT for the public repo
+STATUS.md
+
 # Security scan results — local
 .agentic-security/
 
