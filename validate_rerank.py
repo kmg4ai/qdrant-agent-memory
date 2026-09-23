@@ -25,6 +25,7 @@ Nie zmienia niczego w Qdrant — czyta tylko istniejące wektory.
 """
 
 import faulthandler
+import json
 import os
 import signal
 import sys
@@ -63,6 +64,13 @@ LAMBDA = 0.01
 # na mały i sprawdzić, czy ścieżka rerankera jest tu w ogóle wykonalna.
 RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"
 EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+# Duży, ręcznie pisany zestaw TRUDNYCH zapytań (104 sztuki). „Trudne" jest
+# sprawdzone maszynowo, nie na słowo: każde zapytanie ma małe przecięcie słów
+# treściowych ze swoim dokumentem, a słowo-klucz jest rzadkie w korpusie
+# (inaczej trafienie w przypadkowy dokument też liczyłoby się jako sukces).
+# Zestaw jest w .gitignore (nazwy projektów, id dokumentów).
+CASES_FILE = "eval_cases_hard_pl.json"
 
 
 def decay(age_days, lmbda=LAMBDA):
@@ -108,6 +116,15 @@ def main():
         sys.exit(3)
     print(f"RAM dostępny: {avail} MB (wymagane ~{need} MB) — OK\n")
 
+    cases_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), CASES_FILE)
+    if os.path.exists(cases_path):
+        with open(cases_path, encoding="utf-8") as f:
+            cases = [(c["query"], c["keyword"]) for c in json.load(f)]
+        print(f"zestaw: {CASES_FILE} — {len(cases)} zapytań")
+    else:
+        cases = ev.CASES
+        print(f"zestaw: wbudowany w eval_pl.py — {len(cases)} zapytań")
+
     client = QdrantClient(
         url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"), timeout=60
     )
@@ -134,7 +151,7 @@ def main():
     # Ten sam model co wdrożony w ingest.py / narzędziu — walidujemy reranker
     # na dokładnie tej przestrzeni, która jest w kolekcji.
     model = TextEmbedding(model_name=EMBED_MODEL)
-    queries = [q for q, _ in ev.CASES]
+    queries = [q for q, _ in cases]
     Q = np.array([v for v in model.embed(queries)], dtype=np.float32)
     Q /= np.maximum(np.linalg.norm(Q, axis=1, keepdims=True), 1e-9)
 
@@ -150,18 +167,20 @@ def main():
     print(f"  reranker gotowy w {time.time() - t0:.1f}s\n")
 
     now = time.time()
+    cand_full_cache = []
     variants = ["cosine", "cosine+decay", "rerank", "rerank+decay"]
     hits = {v: 0 for v in variants}
     rr = {v: 0.0 for v in variants}
     rerank_times = []
 
-    for qi, (query, kw) in enumerate(ev.CASES):
+    for qi, (query, kw) in enumerate(cases):
         order = np.argsort(-(Q[qi] @ D.T))[:CANDIDATES]
         # cand_full — PEŁNY tekst, wyłącznie do sprawdzenia słowa-klucza.
         # cand_texts — obcięty, tylko dla rerankera. Gdyby sprawdzać na
         # obciętym, trafienie leżące poza obcięciem policzyłoby się jako MISS
         # i sztucznie zaniżyło wynik rerankera.
         cand_full = [texts[j] for j in order]
+        cand_full_cache.append(cand_full)
         cand_texts = [t[:MAX_CHARS] for t in cand_full]
         ages = [(now - tss[j]) / 86400 for j in order]
         cos = (Q[qi] @ D.T)[order]
@@ -198,7 +217,15 @@ def main():
             line.append(f"{v}={pos or 'MISS'}")
         print(f"  [{kw:20s}] " + "  ".join(line))
 
-    n = len(ev.CASES)
+    n = len(cases)
+    # Sufit: czy właściwy dokument W OGÓLE trafił do kandydatów. Reranker nie
+    # znajdzie tego, czego nie zwróciło wyszukiwanie wektorowe — ta liczba jest
+    # twardym ograniczeniem zysku z rerankera.
+    in_cands = sum(1 for i, (_, kw) in enumerate(cases)
+                   if any(kw.lower() in cand_full_cache[i][c].lower()
+                          for c in range(len(cand_full_cache[i]))))
+    print(f"\nrecall@{CANDIDATES} (właściwy dokument wśród kandydatów): "
+          f"{in_cands}/{n} = {in_cands / n:.0%} — to SUFIT rerankera")
     print(f"\n{'wariant':16s} {'hit@5':>7s}  {'MRR':>6s}")
     for v in variants:
         print(f"{v:16s} {hits[v]:2d}/{n} = {hits[v] / n:3.0%}  {rr[v] / n:6.3f}")

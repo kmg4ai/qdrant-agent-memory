@@ -38,3 +38,6 @@ agents/opencode/node_modules
 .vscode/
 .idea/
 .DS_Store
+
+# Zestaw ewaluacyjny (nazwy projektów, id dokumentów) — NOT for the public repo
+eval_cases_hard_pl.json
