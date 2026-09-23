@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-09-23 14:34 — Replace-mode safety gate: refuse to delete on a shrinking source
+
+**The defect.** `--replace` — and the four sources that hardcode `mode="replace"`
+— called `clear_source()` FIRST and only then uploaded whatever the input yielded.
+The input is a file on disk, so whenever that file was smaller than last time
+(trimmed, restored from an older copy, archived) the missing entries were deleted
+from Qdrant with no warning and no way back. Measured 2026-09-23:
+`/root/CHANGELOG.md` had lost everything before 2026-09-19, so a plain
+`changelog --replace` would have taken that source from **4665 points down to
+648** and printed a success line.
+
+Append mode was never at risk (content-based IDs make it idempotent, and it never
+deletes) — which is exactly why the hole sat unnoticed in replace mode.
+
+**The fix** — `store_facts()`, `ingest.py`:
+- before clearing, count what is stored for that source and compare it with what
+  is about to be written;
+- if the new count is below `MIN_SURVIVAL_RATIO` (default **0.8**, env
+  `QDRANT_MIN_SURVIVAL`), **REFUSE**: nothing is deleted, the reason is printed
+  with both counts and the percentage, and the run stores 0 facts;
+- `--force-shrink` (or `QDRANT_FORCE_SHRINK=1`) is the escape hatch for a source
+  that genuinely shrank; it prints a warning with the before/after counts;
+- `--force-shrink` is stripped from argv like `--replace`, and forwarded to the
+  child process in `--sequential` mode (the gate runs in the subprocess).
+
+**Verified** 2026-09-23 against the live collection, without touching it:
+`QDRANT_CHANGELOG=<tiny file> ingest.py changelog --replace` printed
+`REFUSED: source=changelog would shrink from 7058 to 2 facts (0% ...)` and the
+source still held **7058** points afterwards. The normal path was verified too —
+`ingest.py infrastructure` replaced its 2 facts as before (no shrink, so the gate
+passes). `--force-shrink` parsing was verified by
+`ingest.py --force-shrink <bogus>`, which named the bogus source and not the flag.
+
+Not covered: the `--force-shrink` path is deliberately untested end-to-end. The
+only way to exercise it against the live collection is to actually delete a
+source, which is the exact outcome the gate exists to prevent.
+
 ## 2026-08-10 06:20 — English-only codebase + squash to single commit
 - Translated the whole codebase to English (zero Polish chars in tracked files): qdrant-agent-memory-tool.py, ingest.py, mcp_server.py, secret_guard.py, datetime_utils.py, opencode TS plugin, both SKILL.md files, CHANGELOG.md, SECURITY.md, install.sh, .env.example, .gitignore, requirements.txt
 - `secret_guard.py`: redaction placeholder changed from the old localized marker to `[REDACTED]`

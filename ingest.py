@@ -27,6 +27,25 @@ COLLECTION = os.getenv("COLLECTION_NAME")
 # --replace forces a full re-ingest (clear + upload everything) instead of incremental append
 FORCE_REPLACE = "--replace" in sys.argv
 
+# Replace-mode SAFETY GATE. How much of the previous content must survive for a
+# `--replace` to count as safe; below this ratio the script REFUSES and deletes
+# nothing.
+#
+# Why this exists: `--replace` cleared the source FIRST and only then uploaded
+# whatever the input yielded. The input is a FILE ON DISK, so whenever that file
+# was smaller than last time — trimmed by a tool, restored from an older copy,
+# archived — the missing entries were deleted from Qdrant with no warning and no
+# way back. Measured 2026-09-23: /root/CHANGELOG.md had lost everything before
+# 2026-09-19, so a plain `changelog --replace` would have taken that source from
+# 4665 points down to 648 and printed success.
+#
+# Append mode is immune (content-based IDs make it idempotent, and it never
+# deletes), so a shrink only ever bites in replace mode — which is exactly where
+# it used to be silent. Override with --force-shrink for a source that genuinely
+# did shrink (e.g. entries archived away on purpose).
+MIN_SURVIVAL_RATIO = float(os.getenv("QDRANT_MIN_SURVIVAL", "0.8"))
+FORCE_SHRINK = "--force-shrink" in sys.argv or os.getenv("QDRANT_FORCE_SHRINK") == "1"
+
 # ===== SOURCE PATHS (configurable via env; defaults are typical locations) =====
 VPS_DOC_PATH = os.getenv("QDRANT_VPS_DOC", os.path.expanduser("~/VPS.md"))
 # Absolutna, bo jako jedyna była względna: uruchomienie z innego katalogu
@@ -90,6 +109,25 @@ def store_facts(facts: list[dict], source: str, mode="replace") -> int:
         f["text"] = scrub(f.get("text", ""), source)
 
     if mode == "replace":
+        # SAFETY GATE — check BEFORE deleting anything. `clear_source` is
+        # irreversible from here: the old points are gone and their text lived
+        # only in the input file, which is the very thing that shrank.
+        before = len(get_existing_ids(source))
+        if before and len(facts) < before * MIN_SURVIVAL_RATIO:
+            if not FORCE_SHRINK:
+                print(
+                    f"  ❌ REFUSED: source={source} would shrink from {before} "
+                    f"to {len(facts)} facts ({len(facts) / before:.0%} of what is "
+                    "stored)."
+                )
+                print(
+                    "     NOTHING was deleted. If the input legitimately shrank, "
+                    "re-run with --force-shrink."
+                )
+                return 0
+            print(
+                f"  ⚠️  --force-shrink: source={source} {before} → {len(facts)} facts"
+            )
         clear_source(source)
         planned = [(f, point_id(source, f["text"])) for f in facts]
     else:
@@ -387,6 +425,10 @@ def main():
             cmd = [sys.executable, __file__, name]
             if FORCE_REPLACE:
                 cmd.append("--replace")
+            if FORCE_SHRINK:
+                # Must travel to the child too — the gate lives in store_facts,
+                # which runs in the subprocess.
+                cmd.append("--force-shrink")
             r = subprocess.run(cmd, capture_output=False)
             if r.returncode != 0:
                 print(f"  ❌ {name} FAILED (exit code {r.returncode})")
@@ -398,7 +440,9 @@ def main():
         return
 
     # Mode with --only (single source); --replace is parsed globally
-    args = [a for a in sys.argv[1:] if a != "--replace"]
+    # Both FLAGS carry no source name — leaving them in would make `--force-shrink`
+    # look like a source and abort with "Unknown: --force-shrink".
+    args = [a for a in sys.argv[1:] if a not in ("--replace", "--force-shrink")]
     only = args[0] if args else None
     if only:
         if only not in SOURCES:
