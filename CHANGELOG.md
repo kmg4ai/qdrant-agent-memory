@@ -1,5 +1,78 @@
 # Changelog
 
+## 2026-09-23 18:20 — Multilingual embedding model + fixed destructive reindex
+
+**Why.** The collection is ~86% Polish (7094 of 8236 points are `changelog`), but
+the embedding model was `all-MiniLM-L6-v2` — English-only. Measured baseline on a
+10-query Polish paraphrase set: **hit@5 = 10%** (semantic only) and **0%** through
+the production path. A Polish query for "kompresja pamięci przed sięgnięciem do
+dysku" scored 0.674 and returned documents about scraping; the same query in
+English scored 0.475 and returned the correct document at rank 2. Higher score
+with worse results is the signature of a model with no Polish representation: the
+texts collapse toward a common direction.
+
+**The swap.** `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` —
+also 384 dims, so **no schema change, no new collection**; Qdrant's config is
+untouched. Model name now lives in one place per file (`EMBED_MODEL`, overridable
+via `QDRANT_EMBED_MODEL`) instead of being hardcoded in three.
+
+**Measured result — improvement confirmed, but not sufficient:**
+
+| model | hit@5 (semantic) | MRR | hit@5 (production) | MRR |
+|---|---|---|---|---|
+| all-MiniLM-L6-v2 | 10% | 0.050 | 0% | 0.000 |
+| multilingual-MiniLM-L12 | 20% | 0.053 | 20% | 0.058 |
+
+The production path went from *broken* (0%) to *matching the embedding's own
+ceiling*. That ceiling is the finding: the full rank curve is
+top-1 **0%**, top-3 10%, top-5 20%, top-10 20%, **top-25 60%**, top-50 70%.
+The correct documents are routinely present but ranked 15–43 — score spread
+between rank 1 and rank 23 is only ~0.04. The model "roughly knows" and cannot
+rank precisely. Corpus has **zero exact duplicate texts**, so this is not
+duplicate crowding. The next lever is a higher-capacity model (768/1024 dims),
+which *would* require a new collection.
+
+**Two bugs found and fixed:**
+
+1. `reindex_source` set `payload["ts_epoch"] = now` and recomputed time features
+   from `now` on every point. A reindex would have collapsed 7094 dated changelog
+   entries into one instant, permanently breaking `--since`/`--window` and time
+   decay — the old dates lived only in the vectors. Now derived from the
+   preserved `ts_epoch`; verified bit-for-bit identical on 15 points before
+   running against all 8236.
+2. `reindex_source` called `_embed` per point, and `_embed` constructs
+   `TextEmbedding` on every call — 8236 ONNX loads for a full reindex. Now batched
+   through one model instance.
+
+**`l2norm` added (`datetime_utils.py`).** Qdrant normalizes the whole 392-vector
+on upsert for cosine — verified: every stored vector has `|v| = 1.000000`. Raw
+model output is *not* unit-norm and differs per model and per text
+(measured: all-MiniLM-L6-v2 → 1.000, multilingual-MiniLM-L12 → 2.83–4.17), so
+without normalization the time features would carry a different weight per
+document, and swapping the model would change two things at once. Normalizing
+first keeps the time/semantic balance identical to before, so the swap changes
+only language quality.
+
+**`reindex-all` command added.** `reindex_source(None)` — recompute the whole
+collection, needed after any model change. Idempotent: recomputes from `text` and
+preserves `ts_epoch`, so re-running after a mid-way failure repairs the mixed
+state.
+
+**`fix_created_at.py`** now uses the same `EMBED_MODEL` — it re-embeds points, so
+a stale hardcoded model would have silently written vectors from a different
+space into the collection.
+
+**`eval_pl.py` added** — 10 Polish paraphrase queries with expected keywords,
+reporting hit@5/MRR for both the semantic-only and production paths. Self-checks
+that each expected keyword exists in the corpus before measuring, so a bad eval
+set fails loudly instead of silently reporting 0%.
+
+**Embedding cache moved out of `/tmp`.** `/tmp` is tmpfs (RAM): 328 MB of model
+weights sat in memory and vanished on reboot, forcing a re-download. Relocated to
+`/root/.cache/fastembed` via `FASTEMBED_CACHE_PATH` in `.env` (fastembed has no
+CLI flag for it but reads this variable). `/tmp` RAM usage 1.2 GB → 871 MB.
+Verified `define_cache_dir()` honours it and the model loads from cache in 3.95 s.
+
 ## 2026-09-23 14:34 — Replace-mode safety gate: refuse to delete on a shrinking source
 
 **The defect.** `--replace` — and the four sources that hardcode `mode="replace"`

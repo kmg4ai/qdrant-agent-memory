@@ -6,6 +6,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agent_id import detect_agent  # noqa: E402  (po sys.path, celowo)
+from datetime_utils import l2norm  # noqa: E402  (po sys.path, celowo)
 import re
 import json
 import time
@@ -25,6 +26,16 @@ client = QdrantClient(
     url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"), timeout=60
 )
 COLLECTION = os.getenv("COLLECTION_NAME")
+
+# Model embeddingu — JEDNO miejsce prawdy. Kolekcja jest w ~86% polska, a model
+# wyłącznie angielski (all-MiniLM-L6-v2) dawał przy polskich zapytaniach wyniki
+# śmieciowe. Wielojęzyczny zamiennik ma ten sam wymiar (384), więc NIE wymaga
+# zmiany schematu kolekcji — tylko przeliczenia wektorów (reindex-all).
+# UWAGA: ingest.py MUSI używać tej samej wartości. Dwa różne modele = zapytania
+# i dokumenty w dwóch różnych przestrzeniach = wyszukiwanie przestaje działać.
+EMBED_MODEL = os.getenv(
+    "QDRANT_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 BACKUP_DIR = os.path.join(os.path.dirname(__file__), "backups")
 
@@ -54,11 +65,21 @@ def _time_features(ts):
 def _embed(text, with_time=True):
     from fastembed import TextEmbedding
 
-    model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vec = list(model.embed([text]))[0].tolist()
+    model = TextEmbedding(model_name=EMBED_MODEL)
+    vec = l2norm(list(model.embed([text]))[0].tolist())
     if with_time and COLLECTION.endswith("-v2"):
         vec += _time_features(time.time())
     return vec
+
+
+def _embed_batch(texts, model):
+    """Embed wielu tekstów JEDNĄ instancją modelu (każdy znormalizowany).
+
+    `_embed` tworzy TextEmbedding przy KAŻDYM wywołaniu — dla reindeksu 8236
+    punktów znaczyłoby to 8236 ładowań ONNX (godziny zamiast minut). Tutaj model
+    powstaje raz i jest przekazywany.
+    """
+    return [l2norm(v.tolist()) for v in model.embed(texts)]
 
 
 def _get_point(pid):
@@ -288,27 +309,63 @@ def update_vector(pid):
     print(f"  Vector recomputed for ID={pid} (dim={len(vec)})")
 
 
-def reindex_source(source):
-    points = [p for p in _scroll_all() if p.payload.get("source") == source]
+def reindex_source(source=None, batch_size=64):
+    """Przelicza wektory źródła (albo CAŁEJ kolekcji, gdy source=None).
+
+    CZAS TREŚCI JEST ZACHOWANY. Poprzednia wersja robiła `ts_epoch = now` oraz
+    cechy czasu z `now`, co przy reindeksie kasowało całą historię: 7094
+    datowanych wpisów changelogu zlewało się w jedną chwilę, a filtry
+    `--since`/`--window` i zanik czasu w rankingu przestawały działać —
+    nieodwracalnie, bo stara data żyła tylko w wektorze.
+
+    Cechy czasu są funkcją DETERMINISTYCZNĄ od `ts_epoch`, więc liczymy je
+    z zachowanego `ts_epoch` — wynik jest identyczny z zachowaniem surowych
+    wymiarów, ale nie wymaga pobierania wektorów.
+
+    Embedding idzie partiami przez JEDNĄ instancję modelu — `_embed` tworzy
+    TextEmbedding przy każdym wywołaniu, więc pętla po 8236 tekstach oznaczałaby
+    8236 ładowań ONNX (godziny zamiast minut).
+    """
+    points = [
+        p for p in _scroll_all() if source is None or p.payload.get("source") == source
+    ]
     if not points:
         print(f"  No points for source='{source}'")
         return
-    print(f"Recomputing vectors: {len(points)} points source='{source}'")
+    print(f"Recomputing vectors: {len(points)} points, source={source or 'ALL'}")
+    print(f"  model: {EMBED_MODEL}")
     _backup(points, "reindex")
+
+    from fastembed import TextEmbedding
     from qdrant_client.models import PointStruct
 
-    texts = [p.payload.get("text", "") for p in points]
-    vecs = [_embed(t, with_time=False) for t in texts]
+    model = TextEmbedding(model_name=EMBED_MODEL)
     upserts = []
-    now = int(time.time())
-    for p, v in zip(points, vecs):
-        payload = dict(p.payload)
-        if COLLECTION.endswith("-v2"):
-            payload["ts_epoch"] = now
-            v = v + _time_features(now)
-        upserts.append(PointStruct(id=p.id, vector=v, payload=payload))
-    client.upsert(collection_name=COLLECTION, points=upserts)
-    print(f"  Recomputed and overwritten {len(upserts)} points")
+    stored = 0
+    missing_ts = 0
+    for bs in range(0, len(points), batch_size):
+        batch = points[bs : bs + batch_size]
+        texts = [p.payload.get("text", "") for p in batch]
+        for p, emb in zip(batch, _embed_batch(texts, model)):
+            payload = dict(p.payload)
+            vec = emb
+            if COLLECTION.endswith("-v2"):
+                ts = payload.get("ts_epoch")
+                if ts is None:
+                    # Nie powinno się zdarzyć w -v2 (ingest zawsze ustawia), ale
+                    # gdy się zdarzy, lepiej głośno policzyć niż cicho zgubić.
+                    missing_ts += 1
+                    ts = int(time.time())
+                    payload["ts_epoch"] = int(ts)
+                vec = vec + _time_features(int(ts))
+            upserts.append(PointStruct(id=p.id, vector=vec, payload=payload))
+        client.upsert(collection_name=COLLECTION, points=upserts)
+        stored += len(upserts)
+        upserts = []
+        print(f"  {stored}/{len(points)}")
+    print(f"  Recomputed and overwritten {stored} points")
+    if missing_ts:
+        print(f"  ⚠️  {missing_ts} punktów bez ts_epoch — ustawione na teraz")
 
 
 # ─── Duplicates ────────────────────────────────────────────────────────
@@ -655,6 +712,9 @@ def help():
         "  qdrant-agent-memory-tool.py reindex-source <source>             — recompute source vectors (backup)"
     )
     print(
+        "  qdrant-agent-memory-tool.py reindex-all                         — recompute ALL vectors (backup; po zmianie modelu)"
+    )
+    print(
         "  qdrant-agent-memory-tool.py find-dupes                          — show duplicates with dates"
     )
     print(
@@ -735,6 +795,8 @@ if __name__ == "__main__":
         update_vector(args[0])
     elif cmd == "reindex-source":
         reindex_source(args[0])
+    elif cmd == "reindex-all":
+        reindex_source(None)
     elif cmd == "find-dupes":
         find_dupes()
     elif cmd == "dedupe":

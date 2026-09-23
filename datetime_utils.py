@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Shared time utilities for Qdrant v2 (ingest + fix_created_at + tool).
+"""Shared utilities for building Qdrant v2 vectors (ingest + fix_created_at + tool).
 
 Time model:
 - ts_epoch = timestamp of the content date (changelog header with time / date from text / mtime)
 - vector time features are based on ts_epoch — consistent
 - (created_at / date were removed — ts_epoch is the only time field)
+
+Vector layout (v2, dim 392): [ embedding(384) | time features(8) ]
 """
 
 import math
@@ -38,6 +40,23 @@ def time_features(ts):
         math.sin(2 * math.pi * dt.hour / 24) * scale,
         math.cos(2 * math.pi * dt.hour / 24) * scale,
     ]
+
+
+def l2norm(vec):
+    """Sprowadza embedding do normy 1 PRZED doklejeniem cech czasu.
+
+    To nie kosmetyka. Qdrant przy dystansie Cosine normalizuje CAŁY wektor
+    (384 embeddingu + 8 cech czasu) do normy 1 — zmierzone 2026-09-23: każdy
+    wektor w kolekcji ma |v| = 1.000000. Gdyby embedding wchodził z własną
+    normą, udział cech czasu zależałby od tej normy, a ona RÓŻNI SIĘ między
+    modelami i między tekstami (zmierzone: all-MiniLM-L6-v2 → 1.000,
+    paraphrase-multilingual-MiniLM-L12-v2 → 2.83–4.17). Wtedy podmiana modelu
+    zmieniałaby DWIE rzeczy naraz: jakość językową i wagę czasu — i nie byłoby
+    wiadomo, która odpowiada za różnicę w wynikach. Po normalizacji waga cech
+    czasu zostaje taka jak przed zmianą, więc zmienia się tylko jedna rzecz.
+    """
+    n = math.sqrt(sum(x * x for x in vec))
+    return [x / n for x in vec] if n else vec
 
 
 def resolve_path(fp):

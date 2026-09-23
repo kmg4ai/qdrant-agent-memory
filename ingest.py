@@ -8,7 +8,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue
 from fastembed import TextEmbedding
-from datetime_utils import content_ts, time_features
+from datetime_utils import content_ts, l2norm, time_features
 
 # Secret Guard — redaction of secrets in all facts before storing
 from secret_guard import scrub
@@ -23,6 +23,14 @@ client = QdrantClient(
     url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"), timeout=60
 )
 COLLECTION = os.getenv("COLLECTION_NAME")
+
+# Model embeddingu — MUSI być identyczny jak EMBED_MODEL w
+# qdrant-agent-memory-tool.py. Dwa różne modele = dokumenty i zapytania
+# w dwóch różnych przestrzeniach = wyszukiwanie zwraca śmieci bez żadnego błędu.
+# Stąd zmienna środowiskowa, żeby dało się je przełączyć jednym ruchem.
+EMBED_MODEL = os.getenv(
+    "QDRANT_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 # --replace forces a full re-ingest (clear + upload everything) instead of incremental append
 FORCE_REPLACE = "--replace" in sys.argv
@@ -145,7 +153,7 @@ def store_facts(facts: list[dict], source: str, mode="replace") -> int:
             return 0
         print(f"  New facts: {len(planned)}/{len(facts)} for source={source}")
 
-    model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    model = TextEmbedding(model_name=EMBED_MODEL)
     total = len(planned)
     stored = 0
     for bs in range(0, total, _BATCH_SIZE):
@@ -154,7 +162,7 @@ def store_facts(facts: list[dict], source: str, mode="replace") -> int:
         vecs = list(model.embed(texts))
         points = []
         for i, (fact, pid) in enumerate(batch):
-            vec = vecs[i].tolist()
+            vec = l2norm(vecs[i].tolist())
             # ts_epoch = content date; time-feature vector consistent with ts_epoch
             cts = content_ts(fact)
             payload = {
