@@ -9,6 +9,8 @@ Your agents forget between sessions. This tool gives them a shared, searchable m
 ## ✨ Features
 
 - **Semantic search** — find past knowledge by *meaning*, not by grep
+- **Multilingual embeddings** — the default model is `paraphrase-multilingual-MiniLM-L12-v2`; a memory written in Polish is found by a Polish paraphrase (an English-only model returned *higher* similarity scores with *worse* results on a Polish corpus)
+- **Cross-encoder reranking** — a second query-time stage re-scores the top 50 candidates; measured **25% → 42%** hit@5 on hard queries (p = 0.0003). Falls back to plain cosine if the model can't load
 - **Time-aware vectors** — optional `-v2` collection ranks fresher memories higher and filters by date
 - **Full CRUD on memory** — view, edit, re-embed, dedupe, delete (with automatic backups)
 - **Secret guard** — patterns that scrub API keys, passwords, and tokens *before* anything is written to Qdrant
@@ -43,10 +45,11 @@ venv/bin/python qdrant-agent-memory-tool.py search "how is nginx auth configured
 
 | Command | Description |
 |---|---|
-| `search "<query>" [limit]` | Semantic search (top-5 by default) |
+| `search "<query>" [limit]` | Semantic search (top-5 by default), reranked |
 | `search "<query>" --all` | Search without time-decay ranking |
 | `search "<query>" --since 2026-07-01` | Only memories from that date onward |
 | `search "<query>" --window 30d` | Only memories from the last 30 days |
+| `search "<query>" --no-rerank` | Skip the reranker (faster, less precise) |
 | `store "<text>" "<source>"` | Save a memory |
 | `setup [name]` | Create the Qdrant collection (dim 392 for `-v2`, else 384) |
 | `show <id>` | Full detail of one memory point |
@@ -58,14 +61,97 @@ venv/bin/python qdrant-agent-memory-tool.py search "how is nginx auth configured
 | `edit-payload <id> key=val ...` | Update only metadata |
 | `update-vector <id>` | Re-embed existing text |
 | `reindex-source <source>` | Re-embed all points of a source (backup first) |
-| `find-dupes` | Show duplicates (with dates) |
+| `reindex-all` | Re-embed the **whole collection** — run after changing the embedding model |
+| `find-dupes` | Duplicates: raw-md5 count **and** date-normalised count |
 | `dedupe` | Remove duplicates, keep newest (backup first) |
+| `dedupe --normalize` | Also collapse copies differing only by their date header — **deletes ~27% of a typical corpus; not proven to improve retrieval** |
 | `delete-id <id>` | Delete one point (backup first) |
 | `delete-source <source>` | Delete a whole source |
 | `delete-text "<fragment>"` | Delete points containing text (confirms) |
 | `delete-fragment "<text>" [--regex ...] [--source ...] [--yes]` | Delete by fragment and/or regex |
 
 Destructive commands take automatic **backups** (stored in `backups/`) before they delete anything.
+
+## 🔄 Switching models
+
+There are **two independent models**, and they switch differently — because they
+sit at different stages of the pipeline:
+
+| | Embedding model | Reranker |
+|---|---|---|
+| Runs at | **index time** — every point stores its vector | **query time** — reads raw text |
+| Switch cost | **full reindex** (vectors are model-specific) | **nothing** — stores no state |
+| Same dimension required? | **YES**, else a new collection | no |
+| Env var | `QDRANT_EMBED_MODEL` | `QDRANT_RERANK_MODEL` |
+| Turn off | — | `QDRANT_RERANK=0` |
+
+**Both are switched with the same tool — no second script is needed.**
+
+### Embedding model (A → B)
+
+Vectors computed by model A mean nothing to model B: the two live in different
+spaces, and mixing them makes search return garbage **with no error raised**.
+So a switch is two steps — rename, then re-embed:
+
+```bash
+# 1. Change the model — one variable, read by both ingest and the tool
+echo 'QDRANT_EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2' >> .env
+
+# 2. Re-embed the whole collection (backs up first; idempotent, safe to re-run)
+venv/bin/python qdrant-agent-memory-tool.py reindex-all
+```
+
+`reindex-all` recomputes every vector from the stored text and **preserves each
+point's `ts_epoch`** — the 8 time features are re-derived from the *content date*,
+never from "now". (An earlier version reset them to now; that would have collapsed
+a dated history into a single instant and permanently broken `--since`/`--window`.)
+
+**The hard constraint is the dimension.** A `-v2` collection is 392-dimensional
+(384 embedding + 8 time features). A model with a different output size cannot be
+reindexed into it — that needs a new collection and a fresh ingest:
+
+| model | dim | drop-in for 392? |
+|---|---|---|
+| `sentence-transformers/all-MiniLM-L6-v2` | 384 | yes — but **English only** |
+| `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384 | yes — **multilingual (default)** |
+| `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` | 768 | **no** — new collection |
+| `intfloat/multilingual-e5-large` | 1024 | **no** — new collection |
+
+### Reranker (query-time second stage)
+
+A cross-encoder reads query and document **together**, so it ranks more precisely
+than cosine alone. It stores nothing, so switching it is one variable:
+
+```bash
+QDRANT_RERANK_MODEL=jinaai/jina-reranker-v2-base-multilingual  # bigger, stronger
+QDRANT_RERANK=0                                               # disable reranking
+QDRANT_RERANK_CANDIDATES=50                                   # recall/rerank tradeoff
+```
+
+Per query it fetches `RERANK_CANDIDATES` by cosine, reranks them, normalises the
+scores to [0,1] and **then** applies the time decay. If the model cannot be
+loaded (weights missing, or too little free RAM) search **falls back to cosine
+with a warning** instead of failing.
+
+> **Memory note.** The multilingual reranker needs ~2.4 GB RSS. On a small VPS
+> running an OOM daemon you may get SIGTERM'd mid-load. The small English
+> `jinaai/jina-reranker-v1-turbo-en` (~0.22 GB RSS) still measured a large gain on
+> a **Polish** corpus — try it before reaching for the big one.
+
+### Measured, not assumed
+
+The numbers below come from 104 hand-written **hard** queries: Polish paraphrases
+with no lexical overlap with their target document, each verified mechanically
+(query/document content-word overlap ≤ 0.34, keyword rare in the corpus).
+
+| pipeline | hit@5 |
+|---|---|
+| cosine + time decay | 25% |
+| **+ reranker** | **42%** (McNemar 21 wins / 3 losses, p = 0.0003) |
+
+`validate_rerank.py` reproduces this measurement; `eval_pl.py` holds a small
+built-in set. **After any model change, re-run them before believing it helped** —
+a change that looks better on ten queries can reverse on a hundred.
 
 ## 🤖 Agent integrations
 
