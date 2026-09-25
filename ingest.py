@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Ingests documentation into Qdrant — RAM-safe: 20 facts/batch + gc.collect()
-import os, sys, re, gc, hashlib, subprocess
+import os, sys, re, gc, glob, hashlib, subprocess
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -63,6 +63,43 @@ CHANGELOG_PATH = os.getenv("QDRANT_CHANGELOG", "/root/CHANGELOG.md")
 WWW_ROOT = os.getenv("QDRANT_WWW_ROOT", "/var/www")
 NGINX_DIR = os.getenv("QDRANT_NGINX_DIR", "/etc/nginx/sites-enabled")
 SYSTEMD_DIR = os.getenv("QDRANT_SYSTEMD_DIR", "/etc/systemd/system")
+
+# ─── Źródła reguł (rules/ + globalne AGENTS) ───────────────────────────
+# CELOWO BEZ DOMYŚLNYCH ŚCIEŻEK. To repozytorium jest publiczne i ogólne —
+# ścieżki konkretnej maszyny nie mają tu czego szukać. Ustaw je u siebie
+# w `.env` (jest w .gitignore), a jeśli ich nie ustawisz, funkcja niżej
+# POWIE, co zrobić, zamiast po cichu nic nie robić.
+#
+#   QDRANT_RULES_DIR=/sciezka/do/twoich/regul        (katalog z plikami *.md)
+#   QDRANT_AGENTS_FILES=/sciezka/AGENTS.md:/sciezka/AGENTS(PL).md
+#                       ^ wiele plików rozdziela się DWUKROPKIEM
+#
+# Pełny opis: README.md → „Making the rules ingest work".
+RULES_DIR = os.getenv("QDRANT_RULES_DIR", "").strip()
+AGENTS_FILES = [
+    p.strip() for p in os.getenv("QDRANT_AGENTS_FILES", "").split(":") if p.strip()
+]
+
+_HOWTO = """
+  ── Jak włączyć ingest reguł ──────────────────────────────────────────
+  Ten wpis nie ma skonfigurowanych żadnych źródeł, więc nic nie zapisał.
+  Dopisz do swojego `.env` (NIE do repo — `.env` jest w .gitignore):
+
+      QDRANT_RULES_DIR=/ścieżka/do/katalogu/z/regułami
+      QDRANT_AGENTS_FILES=/ścieżka/AGENTS.md:/ścieżka/AGENTS(PL).md
+
+  `QDRANT_RULES_DIR` to katalog, z którego czytane są WSZYSTKIE pliki `*.md`.
+  `QDRANT_AGENTS_FILES` to lista plików rozdzielona dwukropkiem.
+  Potem uruchom ponownie:
+
+      ingest.py infrastructure
+
+  Szczegóły i przykład: README.md → „Making the rules ingest work".
+  ──────────────────────────────────────────────────────────────────────
+"""
+
+# Pozycja listy numerowanej: „12. **No magic numbers** — ..."
+_NUMBERED_ITEM = re.compile(r"^\d+\.\s")
 
 
 def clear_source(source: str):
@@ -393,24 +430,134 @@ def ingest_systemd():
     return len(facts)
 
 
+def _chunk_rules_file(text, path):
+    """Dzieli jeden plik reguł na fakty (jedna reguła = jeden fakt).
+
+    Pliki mają DWA kształty i oba trzeba obsłużyć:
+      - `vps-devops.md` — tytuł `#` + sekcje `##`
+      - `python.md`     — tytuł `#` + lista numerowana (`1. ...`, `2. ...`)
+    Dzielenie tylko po `##` pomijałoby CAŁE pliki językowe (python, css, js, ts,
+    html) — czyli dokładnie te reguły, po które agent sięga najczęściej.
+
+    Tytuł pliku wchodzi do każdego faktu jako przedrostek: bez niego fakt
+    „No `except: pass` — log every exception" nie mówi, że chodzi o Pythona.
+    """
+    lines = text.splitlines()
+    title = next((ln[2:].strip() for ln in lines if ln.startswith("# ")), "")
+    stem = os.path.basename(path)
+    head = f"[{stem} — {title}] " if title else f"[{stem}] "
+
+    # Który to kształt? Sekcje `##` wygrywają, gdy są; inaczej lista numerowana.
+    split_on_items = not any(ln.startswith("## ") for ln in lines)
+
+    chunks, current = [], None
+    for ln in lines:
+        if ln.startswith("## "):
+            if current:
+                chunks.append(current)
+            current = [ln[3:].strip(), []]
+        elif split_on_items and _NUMBERED_ITEM.match(ln):
+            if current:
+                chunks.append(current)
+            current = [ln.strip(), []]
+        elif current is not None:
+            current[1].append(ln)
+    if current:
+        chunks.append(current)
+
+    facts = []
+    for heading, body in chunks:
+        body_text = "\n".join(body).strip()
+        # UWAGA: nie wolno pomijać pustego `body`. W plikach-listach treść
+        # reguły JEST nagłówkiem („1. **No semicolons** — ...”), a `body` bywa
+        # puste. Warunek `if not body_text: continue` wyrzucał wtedy CAŁY plik
+        # — dokładnie te pliki językowe, dla których ten podział powstał.
+        text = f"{head}{heading}" + (f"\n{body_text}" if body_text else "")
+        facts.append(
+            {
+                "text": text,
+                "section": heading[:80],
+                "file_path": path,
+                "type": "rules",
+            }
+        )
+    return facts
+
+
+def _clear_file_paths(source, paths):
+    """Kasuje ze źródła TYLKO fakty pochodzące z podanych plików.
+
+    `clear_source` czyści całe źródło — a to skasowałoby również fakty dodane
+    przez `store`, które nie pochodzą z żadnego pliku. Odświeżenie reguł nie
+    może niszczyć niezwiązanych wspomnień (w `infrastructure` są trzy takie).
+    """
+    if not paths:
+        return
+    # Filtr po `file_path` wymagałby indeksu keyword na tym polu, którego nie ma
+    # (Qdrant odrzuca: „Index required but not found"), a założenie indeksu to
+    # zmiana schematu kolekcji. Zamiast tego filtrujemy po `source` — to pole
+    # JEST zindeksowane — a `file_path` sprawdzamy w Pythonie.
+    wanted = set(paths)
+    to_delete = []
+    offset = None
+    while True:
+        page, offset = client.scroll(
+            collection_name=COLLECTION,
+            limit=256,
+            offset=offset,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="source", match=MatchValue(value=source))]
+            ),
+            with_payload=["file_path"],
+            with_vectors=False,
+        )
+        for p in page:
+            if p.payload.get("file_path") in wanted:
+                to_delete.append(p.id)
+        if offset is None:
+            break
+    if not to_delete:
+        return
+    # Bez kopii zapasowej — i celowo: kasujemy wyłącznie fakty odtwarzalne
+    # z plików, które nadal leżą na dysku (i w tej samej chwili są wstawiane
+    # na nowo). Kopia nie miałaby czego ratować.
+    client.delete(collection_name=COLLECTION, points_selector=to_delete)
+
+
 def ingest_infrastructure():
-    # Sample static facts (teach your own!). Write your own, and they will be
-    # ingested with source="infrastructure". Remember: secret_guard.py redacts secrets.
-    facts = [
-        {
-            "text": "Example fact: disk usage is checked before/after installs with df -h /.",
-            "section": "infrastructure",
-            "file_path": "rules",
-            "type": "infrastructure",
-        },
-        {
-            "text": "Example fact: after every deploy, append to the project CHANGELOG.md.",
-            "section": "infrastructure",
-            "file_path": "rules",
-            "type": "infrastructure",
-        },
-    ]
-    store_facts(facts, source="infrastructure", mode="replace")
+    """Reguły z `rules/*.md` + globalne AGENTS → źródło `infrastructure`.
+
+    ODŚWIEŻANIE PER PLIK, nie per źródło: fakty z plików, które właśnie
+    czytamy, są podmieniane (żeby edycja reguły nie zostawiała starej wersji),
+    a fakty dodane przez `store` — które nie pochodzą z żadnego pliku —
+    zostają nietknięte.
+
+    Wcześniej była tu ATRAPA z dwoma przykładami na sztywno. Skutek: opisany
+    w AGENTS.md przepis „po każdej zmianie AGENTS.md przeingestuj
+    infrastructure" nie robił NIC — a z `--force-shrink` zastąpiłby trzy
+    prawdziwe fakty dwoma przykładami (bramka shrinku właśnie to złapała).
+    """
+    paths = []
+    if RULES_DIR and os.path.isdir(RULES_DIR):
+        paths += sorted(glob.glob(os.path.join(RULES_DIR, "*.md")))
+    paths += [p for p in AGENTS_FILES if os.path.isfile(p)]
+
+    if not paths:
+        # Nie „cicho nic" — powiedz wprost, czego brakuje i jak to ustawić.
+        print(_HOWTO)
+        if RULES_DIR:
+            print(f"  (QDRANT_RULES_DIR={RULES_DIR!r} — taki katalog nie istnieje "
+                  "albo nie ma w nim plików .md)")
+        return 0
+
+    facts = []
+    for p in paths:
+        with open(p, encoding="utf-8") as fh:
+            facts += _chunk_rules_file(fh.read(), p)
+
+    print(f"  Plików: {len(paths)}, faktów: {len(facts)}")
+    _clear_file_paths("infrastructure", paths)
+    return store_facts(facts, source="infrastructure", mode="append")
     return len(facts)
 
 

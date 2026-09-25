@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-09-25 13:29 — Rules ingest actually works + tutorial for a fresh clone
+
+**The defect.** `ingest_infrastructure()` was a **stub holding two hardcoded
+example facts**. It read no rules at all. Consequences: the documented workflow
+("after every AGENTS.md change, re-ingest infrastructure") did **nothing**, and
+running it with `--force-shrink` would have replaced three real stored facts
+with two examples — the shrink gate refused, which is how it was found.
+
+**The fix.** It now reads real sources and chunks them **one rule = one fact**:
+
+| file shape | split on |
+|---|---|
+| `# Title` + `## Section` | each `##` section |
+| `# Title` + numbered list | each numbered item |
+
+Both shapes are needed. Splitting only on `##` skipped **whole language files**
+(`python.md`, `css.md`, `js.md`, `ts.md`, `html.md`) — exactly the rules an agent
+reaches for most. A first cut of this fix did skip them and reported `0 faktów`
+for each; the file title is now prefixed onto every fact so a bare
+`No except: pass — logging` still says it is about Python.
+
+**Refresh is PER FILE, not per source.** Facts from the files being read are
+replaced (an edited rule must not leave its old version behind); facts added via
+`store`, which come from no file, are left alone. `clear_source` would have
+deleted those too — three such facts live in `infrastructure`.
+
+> Filtering by `file_path` needs a keyword index that the collection does not
+> have, and adding one is a schema change. So the code filters on `source` (which
+> *is* indexed) and checks `file_path` in Python.
+
+**Two versions, by construction.** The public repo carries the generic code; the
+machine-specific paths live only in `.env` (`.gitignore`d). With no sources
+configured the command prints step-by-step instructions and stores **zero** facts
+— a fresh clone cannot silently do nothing, and cannot delete anything.
+
+- `.env.example` documents every variable, including the new model and reranker
+  ones.
+- `README.md` gains **"🧠 Ingesting your coding rules"** — what to set, what the
+  output should look like, how files are split, and how to refresh.
+
+Measured on a 27-file rules tree: **262 facts, 0 files yielding nothing**, and
+the three `store`-added facts in the source left intact.
+
 ## 2026-09-23 18:20 — Multilingual embedding model + fixed destructive reindex
 
 **Why.** The collection is ~86% Polish (7094 of 8236 points are `changelog`), but

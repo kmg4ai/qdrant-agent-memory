@@ -234,6 +234,76 @@ Destructive tools (`dedupe`, `delete_*`, `reindex_source`) require `confirm=true
 > This is an **optional** layer. The skill/plugin integrations above give you the
 > full 18 operations with no MCP server — pick whichever fits your setup.
 
+## 🧠 Ingesting your coding rules
+
+`ingest.py infrastructure` reads your coding rules and stores them in the
+collection, so an agent can recall a rule **by meaning** ("can I use `except:
+pass`?") instead of you re-pasting it every session.
+
+**It ships with no sources configured — on purpose.** This repo is generic and
+one machine's paths do not belong in it. So the first run tells you what to do
+rather than quietly doing nothing:
+
+```
+$ uv run --project . --quiet ingest.py infrastructure
+  ── Jak włączyć ingest reguł ──────────────────────────────
+  ...  (how to configure it)
+  ✅ 0 facts from infrastructure
+```
+
+### Do this
+
+**1.** Add to `.env` — which is `.gitignore`d, never commit it:
+
+```bash
+# a DIRECTORY: every *.md inside it is read
+QDRANT_RULES_DIR=/path/to/your/rules
+
+# individual files, separated by COLONS
+QDRANT_AGENTS_FILES=/path/to/AGENTS.md:/path/to/AGENTS(PL).md
+```
+
+Both are optional — set whichever you have. (`.env.example` documents every
+variable.)
+
+**2.** Run it:
+
+```bash
+uv run --project . --quiet ingest.py infrastructure
+```
+
+**3.** Check the output — it reports what it found:
+
+```
+  Plików: 27, faktów: 262
+  Stored 262 facts, source=infrastructure
+```
+
+### How your files get split
+
+**One rule = one fact**, so a search returns the rule itself rather than a wall
+of text. Two file shapes are handled, because both are common:
+
+| your file looks like | split on |
+|---|---|
+| `# Title` + `## Section` headings | each `##` section |
+| `# Title` + a numbered list (`1. …`, `2. …`) | each numbered item |
+
+The file's title is prefixed onto every fact: a bare `No except: pass — log
+every exception` never says it is about Python, so it is stored as
+`[python.md — Zen of Python] No except: pass — log every exception`.
+
+### Editing a rule later
+
+Run the same command again. Facts that came from the files being read are
+**replaced** — so an edited rule does not leave its old version behind — while
+facts added with `store` (which come from no file at all) are left untouched.
+
+> **If your collection holds a lot of other material** (deploy logs, changelogs),
+> rules are a small minority of the points and a plain search may not surface
+> them. Giving the rules their own collection is the reliable fix — filtering by
+> `source` is the lightweight one.
+
 ## 📥 Bulk ingest from your machine
 
 `ingest.py` indexes your own knowledge files (VPS doc, changelog, nginx/systemd configs, project READMEs):
