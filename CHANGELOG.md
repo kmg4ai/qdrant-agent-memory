@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-09-25 14:33 — A `-v2` collection cannot un-rank freshness; measured on rules
+
+**The finding.** Rules retrieval on the rules source measured **4% hit@5 (1/28)**.
+Isolating the cause, offline against the same 265 facts with the same model:
+
+| vector compared | hit@5 |
+|---|---|
+| embedding only — 384 dims | **50%** |
+| embedding **+ the 8 time features** — 392 dims, as stored | **21%** |
+| + the explicit decay multiplier — default `search` | **4%** |
+
+So the loss is **29 pp from the time features baked into the vector** and **17 pp
+more from the decay multiplier** — 50% down to 4%.
+
+**Why it matters.** `--all` only skips the *multiplier*. The time signal also
+lives **inside the vector**, so `search --all` cannot recover more than 21%.
+For content where freshness is not a signal — coding rules, instructions,
+reference material — the `-v2` design taxes every query, and the tax is not
+optional.
+
+**A claim of mine this corrects.** I earlier reported that "the English reranker
+ranks Polish rules poorly" and called it a hypothesis. It was **wrong**: the
+paired measurement shows the reranker is **neutral** on rules (1 win / 1 loss,
+p = 1.0000, and 8/28 vs 6/28 without decay, p = 0.7539). The culprit was the
+time signal, not the reranker. Had I not measured it, a working component would
+have been blamed and possibly removed.
+
+**Also in this change:** `find-dupes`' two leftover example facts deleted
+(backup `backups/20260925_134741-delete-id.json`); the printed score fixed — it
+is now `rank=0.703 [rerank=0.70 cos=0.444]` instead of a bare normalised number
+that always read ≈1.0 for the top hit and meant nothing.
+
+**Proposed, not done:** timeless content belongs in a collection **without** time
+features (the tool already supports 384-dim collections — `setup` creates either).
+That is the only way to recover the full 50%.
+
 ## 2026-09-25 13:41 — Code is 1:1 with the public repo; all machine paths in `.env`
 
 **`ingest.py` no longer names a single machine path.** The four remaining

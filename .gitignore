@@ -41,3 +41,4 @@ agents/opencode/node_modules
 
 # Zestaw ewaluacyjny (nazwy projektów, id dokumentów) — NOT for the public repo
 eval_cases_hard_pl.json
+eval_cases_rules_pl.json

@@ -637,24 +637,38 @@ def search(text, limit=10, fresh=True, since=None, window_days=None, lmbda=0.01,
                 # więc bez normalizacji pomnożenie przez ~0.77 nic nie zmienia
                 # i zanik czasu przestaje cokolwiek znaczyć.
                 norm = _minmax(raw)
-                scored = [(norm[i] * cand[i][1], cand[i][0]) for i in range(len(cand))]
+                # Trzeci element to PODPIS dla wydruku. Po normalizacji min-max
+                # najwyższy wynik to ZAWSZE ~1.0 × decay, więc sama ta liczba
+                # nie mówi nic o trafności — zapytanie o średniki w Pythonie
+                # pokazywało 0.994 dla reguły o `git push`. Dlatego drukujemy
+                # obok surowy cosinus, który da się interpretować.
+                scored = [
+                    (
+                        norm[i] * cand[i][1],
+                        cand[i][0],
+                        f"rerank={norm[i]:.2f} cos={cand[i][0].score:.3f}",
+                    )
+                    for i in range(len(cand))
+                ]
             except Exception as e:
                 print(f"  ⚠️  rerank nieudany ({type(e).__name__}: {e}) — ranking po cosinusie")
 
     if scored is None:
-        scored = [(r.score * d, r) for r, d in cand]
+        scored = [(r.score * d, r, f"cos={r.score:.3f}") for r, d in cand]
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    for score, r in scored[:limit]:
+    for score, r, detail in scored[:limit]:
         ts = _point_ts(r)
         age = (now_ts - ts) / 86400 if ts else None
         age_s = f"{age:.0f}d" if age is not None else "-"
         print(
-            f"  score={score:.3f} ({age_s}) ID={r.id}  src={r.payload.get('source', '?')}"
-            f"  by={r.payload.get('agent', '?')}"
+            f"  rank={score:.3f} [{detail}] ({age_s}) ID={r.id}"
+            f"  src={r.payload.get('source', '?')}  by={r.payload.get('agent', '?')}"
         )
         print(f"      text: {r.payload.get('text', '')[:120]}")
-    return scored[:limit]
+    # Zwracamy DWUELEMENTOWE krotki jak dotąd — `rank` to pozycja w rankingu,
+    # nie podobieństwo. Zmiana arności psułaby istniejących wywołujących.
+    return [(s, r) for s, r, _ in scored[:limit]]
 
 
 def delete_by_ids(ids):
