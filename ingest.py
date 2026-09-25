@@ -59,10 +59,30 @@ VPS_DOC_PATH = os.getenv("QDRANT_VPS_DOC", os.path.expanduser("~/VPS.md"))
 # Absolutna, bo jako jedyna była względna: uruchomienie z innego katalogu
 # kończyło się FileNotFoundError. Reszta ścieżek w tym pliku jest absolutna
 # (VPS.md, /var/www, /etc/nginx, /etc/systemd) — ta jedna została przeoczona.
-CHANGELOG_PATH = os.getenv("QDRANT_CHANGELOG", "/root/CHANGELOG.md")
-WWW_ROOT = os.getenv("QDRANT_WWW_ROOT", "/var/www")
-NGINX_DIR = os.getenv("QDRANT_NGINX_DIR", "/etc/nginx/sites-enabled")
-SYSTEMD_DIR = os.getenv("QDRANT_SYSTEMD_DIR", "/etc/systemd/system")
+CHANGELOG_PATH = os.getenv("QDRANT_CHANGELOG", "")
+# CELOWO BEZ DOMYŚLNYCH ŚCIEŻEK — to repozytorium jest publiczne i ogólne,
+# a układ katalogów jednej maszyny nie ma w nim czego szukać. Wszystkie
+# wartości ustawia się w `.env` (patrz `.env.example`). Gdy brakuje którejś,
+# odpowiednia funkcja MÓWI, czego brakuje — patrz `_require_path()`.
+WWW_ROOT = os.getenv("QDRANT_WWW_ROOT", "").strip()
+NGINX_DIR = os.getenv("QDRANT_NGINX_DIR", "").strip()
+SYSTEMD_DIR = os.getenv("QDRANT_SYSTEMD_DIR", "").strip()
+
+
+def _require_path(value, var, what):
+    """Czy źródło jest skonfigurowane i istnieje na dysku.
+
+    Bez tego puste `WWW_ROOT` kończyłoby się `glob` po katalogu "" (czyli nic)
+    albo `open("")` i wyjątkiem. Funkcje ingestu mają powiedzieć, czego brakuje,
+    zamiast wysypać się albo po cichu nic nie zrobić.
+    """
+    if not value:
+        print(f"  {what}: NIE skonfigurowano — ustaw {var} w .env (patrz .env.example)")
+        return False
+    if not os.path.exists(value):
+        print(f"  {what}: {var}={value!r} nie istnieje")
+        return False
+    return True
 
 # ─── Źródła reguł (rules/ + globalne AGENTS) ───────────────────────────
 # CELOWO BEZ DOMYŚLNYCH ŚCIEŻEK. To repozytorium jest publiczne i ogólne —
@@ -231,6 +251,8 @@ def store_facts(facts: list[dict], source: str, mode="replace") -> int:
 
 
 def ingest_vps():
+    if not _require_path(VPS_DOC_PATH, "QDRANT_VPS_DOC", "Dokument VPS"):
+        return 0
     facts = []
     sec = ""
     with open(VPS_DOC_PATH) as f:
@@ -286,6 +308,8 @@ def ingest_vps():
 def ingest_changelog():
     # By default incremental (append) — embeddings only for new entries.
     # Full re-ingest: ingest.py changelog --replace
+    if not _require_path(CHANGELOG_PATH, "QDRANT_CHANGELOG", "Changelog"):
+        return 0
     mode = "replace" if FORCE_REPLACE else "append"
     facts = []
     date = ""
@@ -324,15 +348,20 @@ def ingest_changelog():
 def ingest_instructions():
     import glob
 
+    if not _require_path(WWW_ROOT, "QDRANT_WWW_ROOT", "Katalog projektów"):
+        return 0
     facts = []
     proj = {}
+    # Nazwa projektu = pierwszy segment ŚCIEŻKI WZGLĘDNEJ od WWW_ROOT.
+    # Wcześniej było tu `f.split("/var/www/")[1]` — czyli korzeń zaszyty na
+    # sztywno, który psuł się, gdy tylko QDRANT_WWW_ROOT wskazywał gdzie indziej.
     for f in glob.glob(os.path.join(WWW_ROOT, "**", "INSTRUKCJA*"), recursive=True):
         if "node_modules" not in f and ".git" not in f:
-            pn = f.split("/var/www/")[1].split("/")[0]
+            pn = os.path.relpath(f, WWW_ROOT).split(os.sep)[0]
             proj.setdefault(pn, []).append(f)
     for f in glob.glob(os.path.join(WWW_ROOT, "**", "README.md"), recursive=True):
         if "node_modules" not in f and ".git" not in f:
-            pn = f.split("/var/www/")[1].split("/")[0]
+            pn = os.path.relpath(f, WWW_ROOT).split(os.sep)[0]
             if f not in proj.get(pn, []):
                 proj.setdefault(pn, []).append(f)
     for project, files in proj.items():
@@ -370,6 +399,8 @@ def ingest_instructions():
 def ingest_nginx():
     import glob
 
+    if not _require_path(NGINX_DIR, "QDRANT_NGINX_DIR", "Konfiguracja nginx"):
+        return 0
     facts = []
     for fp in glob.glob(os.path.join(NGINX_DIR, "*")):
         if "default" in fp:
@@ -404,6 +435,8 @@ def ingest_nginx():
 def ingest_systemd():
     import glob
 
+    if not _require_path(SYSTEMD_DIR, "QDRANT_SYSTEMD_DIR", "Usługi systemd"):
+        return 0
     facts = []
     for fp in glob.glob(os.path.join(SYSTEMD_DIR, "*.service")):
         try:

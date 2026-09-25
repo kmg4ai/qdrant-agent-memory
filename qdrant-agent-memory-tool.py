@@ -571,7 +571,7 @@ def _minmax(xs):
 
 # ─── Deleting (existing) ───────────────────────────────────────────────
 def search(text, limit=10, fresh=True, since=None, window_days=None, lmbda=0.01,
-           rerank=None):
+           rerank=None, source=None):
     vec = _embed(text)
     # Optional time filter — native DATETIME index
     from qdrant_client.models import Range as QdRange
@@ -587,10 +587,18 @@ def search(text, limit=10, fresh=True, since=None, window_days=None, lmbda=0.01,
             return
     if window_days:
         gte = now_ts - window_days * 86400
+    # Filtry łączymy w JEDNĄ listę `must`. Wcześniej był tylko czas; filtr po
+    # źródle jest potrzebny, bo gdy kolekcja jest zdominowana przez jedno źródło
+    # (u nas: changelog to ~85% punktów), mniejszość — np. reguły — bywa
+    # wypychana poza top-N i praktycznie nieosiągalna zwykłym zapytaniem.
+    must = []
     if gte is not None:
-        time_filter = Filter(
-            must=[FieldCondition(key="ts_epoch", range=QdRange(gte=gte))]
-        )
+        must.append(FieldCondition(key="ts_epoch", range=QdRange(gte=gte)))
+    if source:
+        # `source` JEST zindeksowane w tej kolekcji, więc MatchValue działa.
+        # (Dla `file_path` indeksu nie ma i Qdrant taki filtr odrzuca.)
+        must.append(FieldCondition(key="source", match=MatchValue(value=source)))
+    time_filter = Filter(must=must) if must else None
 
     use_rerank = RERANK_ENABLED if rerank is None else rerank
     # Przy reranku pobieramy 50 kandydatów (recall@50 = 64%), bez niego
@@ -849,7 +857,7 @@ def store(text, source="manual"):
 def help():
     print("Usage:")
     print(
-        "  qdrant-agent-memory-tool.py search <text> [limit] [--all] [--since D] [--window Nd] [--no-rerank]"
+        "  qdrant-agent-memory-tool.py search <text> [limit] [--all] [--since D] [--window Nd] [--no-rerank] [--source SRC]"
     )
     print(
         "        — semantic search; domyślnie z rerankerem (+26 pp hit@5, ~5 s). --no-rerank = sam cosinus"
@@ -925,8 +933,12 @@ if __name__ == "__main__":
         # --no-rerank: ranking samym cosinusem. Reranker daje +26 pp trafień,
         # ale kosztuje ~5 s i jest angielski — bywa potrzebny wariant szybki.
         rerank = False if "--no-rerank" in args else None
+        # --source <nazwa>: zawęź do jednego źródła. Bez tego mniejszościowe
+        # źródła (np. reguły) toną w zdominowanym korpusie.
+        source = args[args.index("--source") + 1] if "--source" in args else None
         search(
-            text, limit, fresh=fresh, since=since, window_days=window_days, rerank=rerank
+            text, limit, fresh=fresh, since=since, window_days=window_days,
+            rerank=rerank, source=source,
         )
     elif cmd == "store":
         text = args[0]

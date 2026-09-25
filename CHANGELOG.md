@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-09-25 13:41 — Code is 1:1 with the public repo; all machine paths in `.env`
+
+**`ingest.py` no longer names a single machine path.** The four remaining
+defaults are gone:
+
+```diff
+-CHANGELOG_PATH = os.getenv("QDRANT_CHANGELOG", "/root/CHANGELOG.md")
+-WWW_ROOT       = os.getenv("QDRANT_WWW_ROOT",  "/var/www")
+-NGINX_DIR      = os.getenv("QDRANT_NGINX_DIR", "/etc/nginx/sites-enabled")
+-SYSTEMD_DIR    = os.getenv("QDRANT_SYSTEMD_DIR","/etc/systemd/system")
++CHANGELOG_PATH = os.getenv("QDRANT_CHANGELOG", "")
++WWW_ROOT       = os.getenv("QDRANT_WWW_ROOT", "").strip()
++NGINX_DIR      = os.getenv("QDRANT_NGINX_DIR", "").strip()
++SYSTEMD_DIR    = os.getenv("QDRANT_SYSTEMD_DIR", "").strip()
+```
+
+Also fixed: `ingest_instructions()` derived the project name with
+`f.split("/var/www/")[1]` — the root hardcoded a second time, which broke the
+moment `QDRANT_WWW_ROOT` pointed anywhere else. It now uses
+`os.path.relpath(f, WWW_ROOT).split(os.sep)[0]`.
+
+**Guards, so an empty path cannot fail silently or crash.** `_require_path()`
+makes each source say which variable is missing and store **zero** facts.
+Verified both directions: with `.env` configured every source resolves; with all
+variables blanked — a fresh clone — all six print their hint and store nothing.
+
+**`search --source <name>` added.** Measured problem: in a corpus where one
+source dominates (here ~85% changelog), a minority source is pushed outside the
+top-N and is effectively unreachable. Filtering by `source` (which *is* indexed)
+fixes reachability. Note `file_path` has no index, so a filter on it is rejected
+by Qdrant — `source` is the one that works.
+
+### Two problems found while testing — not fixed here
+
+1. **The printed `score` stopped meaning anything.** Since the reranker
+   integration normalises candidate scores with min-max, the top hit always
+   prints ≈1.0 × decay. A query about Python semicolons printed `0.994` for a
+   rule about `git push` — that is rank 1, not a 99% match. The number now
+   misleads; printing the cosine score alongside would restore interpretation.
+2. **The English reranker ranks Polish rules poorly.** Same query, restricted to
+   the rules source: the top hits were PRIORYTET 14 (git push), PRIORYTET 9
+   (plan mode) and PRIORYTET 12 (reporting) — nothing about Python. The reranker
+   measured well on the changelog corpus; it appears to hurt on this subset.
+   Hypothesis, not a conclusion — needs the same paired measurement that the
+   changelog corpus got.
+
 ## 2026-09-25 13:29 — Rules ingest actually works + tutorial for a fresh clone
 
 **The defect.** `ingest_infrastructure()` was a **stub holding two hardcoded
