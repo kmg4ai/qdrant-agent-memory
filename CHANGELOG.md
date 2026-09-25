@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-09-25 18:31 — Rules retrieve 4% → 50%: give them one shared timestamp
+
+**The fix, and why it is the right one.** Rules are **timeless**, but their
+`ts_epoch` came from the rules file's *modification time* (June 2026) or from a
+stray date in the text. A `-v2` collection weights freshness at **28% of every
+similarity score**, so a rule in a file nobody had touched since June lost to a
+rule in a file saved that morning — with no relation to which rule answered the
+question.
+
+All rules now get **the same timestamp** (the moment of ingest). That makes the
+freshness term a **constant** across rules, so it stops discriminating between
+them and ranking reverts to comparing text alone.
+
+**Measured through the real `search()`, same 28 queries:**
+
+| | before | after |
+|---|---|---|
+| cosine only | 4% | **50%** |
+| + reranker | 4% | 43% |
+
+**50% is exactly what the offline 384-dimension measurement predicted** — which
+is the confirmation, not a coincidence: with the freshness term constant, the
+ranking is pure content similarity.
+
+**What this does NOT do:** it leaves the 28% weight alone. That weight does real
+work for the changelog, where a date is a fact about the world. The fix only
+stops *file-edit recency* being mistaken for *rule relevance*.
+
+**Caveat, stated in the code:** rules must be re-ingested after edits, or they
+drift back into looking stale. That is already the documented workflow.
+
+### `content_ts()` no longer takes a date from anywhere in the text
+
+It took `max()` of every `20xx-xx-xx` in the body, so a date *mentioned* in the
+content beat the entry's real header date: a fact starting `2026-08-27 23:12:`
+was dated `2026-08-28`, and a cron example in a package README dated a fact
+`2010-01-12`. It now reads a date **only from the start of the text**.
+
+Scope measured before changing anything: **183 of 8639 points (2.1%)**, every one
+of them a correction of this bug. Note the fix is in the code but **not yet in
+the stored vectors** for those 183 — applying it needs a re-ingest of their
+sources, and `changelog --replace` is correctly refused by the shrink gate (the
+file holds 3106 entries against 7094 stored points, so it would delete ~4000).
+
+### On the disagreement that produced this
+
+I first proposed a **separate 384-dim collection without time features**. That
+would have worked but costs a second collection plus routing in the tool, the
+skill and MCP. The owner pushed back — *"I want to find newer information, so I
+need that tag"* — and was right that the timestamp is not the problem. Chasing
+the objection produced a ~3-line fix with the same measured outcome. The heavier
+proposal was premature.
+
 ## 2026-09-25 14:33 — A `-v2` collection cannot un-rank freshness; measured on rules
 
 **The finding.** Rules retrieval on the rules source measured **4% hit@5 (1/28)**.

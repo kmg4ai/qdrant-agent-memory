@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Ingests documentation into Qdrant — RAM-safe: 20 facts/batch + gc.collect()
 import os, sys, re, gc, glob, hashlib, subprocess
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -587,6 +588,22 @@ def ingest_infrastructure():
     for p in paths:
         with open(p, encoding="utf-8") as fh:
             facts += _chunk_rules_file(fh.read(), p)
+
+    # WSZYSTKIE reguły dostają IDENTYCZNY czas wgrania.
+    #
+    # Reguła jest bezczasowa, a `content_ts()` bez tego wpisu brałby datę
+    # modyfikacji PLIKU (u nas czerwiec) albo przypadkową datę z treści.
+    # Kolekcja `-v2` waży świeżość 28% wyniku, więc reguła z pliku nietkniętego
+    # od czerwca przegrywała z regułą z pliku zapisanego dzisiaj — bez związku
+    # z tym, która odpowiada na pytanie.
+    #
+    # Wspólny znacznik sprawia, że ten składnik sumy jest jednakowy dla każdej
+    # reguły, więc przestaje je różnicować i ranking wraca do porównywania
+    # samej treści. Zmierzone: 4% -> ~50% hit@5 na zestawie reguł.
+    # WYMAGA wznawiania reguł po edycji (inaczej znów się „starzeją").
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for f in facts:
+        f["date"] = stamp
 
     print(f"  Plików: {len(paths)}, faktów: {len(facts)}")
     _clear_file_paths("infrastructure", paths)

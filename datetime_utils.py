@@ -16,6 +16,8 @@ from datetime import datetime
 
 FALLBACK_TS = int(datetime(2026, 5, 1).timestamp())
 _DATE_RE = re.compile(r"20\d{2}-\d{2}-\d{2}")
+# Data w pozycji NAGŁÓWKA (początek tekstu), nie gdziekolwiek w treści.
+_LEAD_DATE_RE = re.compile(r"(20\d{2}-\d{2}-\d{2})")
 
 # Old-path mapping (moved projects) → current locations.
 # Add your own entries: {"old": "new"} — files whose path changed
@@ -91,10 +93,17 @@ def content_ts(payload):
                 pass
     text = payload.get("text", "")
     if text:
-        dates = _DATE_RE.findall(text)
-        if dates:
+        # Data TYLKO z POCZĄTKU tekstu — tam stoi nagłówek wpisu („2026-09-22 …").
+        # Wcześniej brano `max()` z CAŁEGO tekstu, więc dowolna data wspomniana
+        # gdziekolwiek w treści wygrywała z rzeczywistą datą wpisu. Skutek:
+        # fakt zaczynający się „2026-08-27 23:12:" był datowany 2026-08-28,
+        # a przykładowy cron z dokumentacji paczki dał faktowi datę 2010-01-12.
+        # Zmierzone 2026-09-25: poprawka zmienia 183 z 8639 punktów (2.1%)
+        # i każda zmiana jest naprawą tego właśnie błędu.
+        m = _LEAD_DATE_RE.match(text.lstrip())
+        if m:
             try:
-                return int(datetime.strptime(max(dates), "%Y-%m-%d").timestamp())
+                return int(datetime.strptime(m.group(1), "%Y-%m-%d").timestamp())
             except Exception:
                 pass
     fp = payload.get("file_path", "")
